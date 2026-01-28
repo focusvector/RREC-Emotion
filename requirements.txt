@@ -1,5 +1,6 @@
-#torch==2.5.1+cu121 # better to install torch 2.5.1 from the official website
-transformers==4.48.2
+# Install PyTorch separately (see environment.yaml)
+# torch==2.5.1 (CUDA 12.4) is required by vllm==0.7.3
+transformers==4.57.6
 datasets==3.4.1
 accelerate==1.6.0
 peft==0.15.0
@@ -10,5 +11,7 @@ tqdm>=4.65.0
 fire==0.7.0
 requests==2.32.3
 vllm==0.7.3
+# Optional (match CUDA build if installed)
+# xformers==0.0.28.post3
 #deepspeed==0.15.4
 # It is essential to install DeepSpeed 0.15.4, Torch 2.5.1, and VLLM 0.7.3 in this specific combination; otherwise, bugs will occur.

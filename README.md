@@ -23,7 +23,7 @@ This project implements reinforcement learning-based training for emotion classi
 The project requires Python 3.11 and uses conda for environment management. Create the environment using the provided configuration:
 
 ```bash
-# Create conda environment from environment.yaml
+# Create conda environment from environment.yaml (recommended)
 conda env create -f environment.yaml
 conda activate RREC
 ```
@@ -100,6 +100,9 @@ dependencies:
 If you prefer manual installation:
 
 ```bash
+# Install torch/torchaudio/torchvision with CUDA 12.4 first
+conda install -y pytorch=2.5.1 torchvision=0.20.1 torchaudio=2.5.1 pytorch-cuda=12.4 -c pytorch -c nvidia
+# Then install python deps
 pip install -r requirements.txt
 ```
 
