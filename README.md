@@ -4,14 +4,14 @@ A GRPO (Group Relative Policy Optimization) training framework for emotion class
 
 ## Overview
 
-This project implements reinforcement learning-based training for emotion classification on the ED_easy_4 subset of Empathetic Dialogues, supporting 4 emotion classes. The system uses vLLM for efficient inference and incorporates reasoning capabilities before classification.
+This project implements reinforcement learning-based training for emotion classification on the ED_hard_a subset of Empathetic Dialogues, supporting 4 emotion classes. The system uses vLLM for efficient inference and incorporates reasoning capabilities before classification.
 
 **Key Features:**
 - GRPO training with vLLM inference engine
 - Chain-of-thought reasoning before emotion classification
 - Support for Gemma-2-2b-it and Qwen2.5-3B-Instruct models
 - LoRA (Low-Rank Adaptation) for efficient fine-tuning
-- 4-class emotion taxonomy (ED_easy_4)
+- 4-class emotion taxonomy (ED_hard_a)
 - Distributed training support with DeepSpeed
 
 **Original Paper:** [R2ec: Towards Large Recommender Models with Reasoning](https://arxiv.org/abs/2505.16994)
@@ -129,47 +129,55 @@ Make sure the paths are absolute paths and the directories contain the complete 
 
 ### Data Preparation
 
-The project uses the ED_easy_4 dataset stored under `data/ED_easy_4/`. To prepare the data:
+The project uses the ED_hard_a dataset stored under `data/ED_hard_a/`. To prepare the data:
 
 1. Run the preprocessing script:
 ```bash
-# Preprocess ED_easy_4 from local CSVs
-python preprocess.py --dataset_name=ED_easy_4 --download=False --output_name=ED_easy_4_processed
+# Preprocess ED_hard_a from local CSVs
+python preprocess.py --dataset_name=ED_hard_a --download=False --output_name=ED_hard_a_processed
 ```
 
 The script will:
-- Read ED_easy_4 local CSVs (train.csv, valid.csv, test.csv, label_tree.tsv)
+- Read ED_hard_a local CSVs (train.csv, valid.csv, test.csv, label_tree.tsv)
 - Clean and normalize text data (HTML unescape, remove tags, normalize whitespace)
 - Map the 4-class label IDs to emotions
 - Process data into HuggingFace datasets format
-- Save the processed dataset to `data/ED_easy_4_processed/`
+- Save the processed dataset to `data/ED_hard_a_processed/`
 
-**Dataset Statistics (ED_easy_4):**
-- Train: 2,386 samples
-- Valid: 358 samples
-- Test: 328 samples
-- Total: 3,072 dialogues with emotion labels
+### Quick Start (Smooth Run)
+
+```bash
+# 1) Prepare data
+python preprocess.py --dataset_name=ED_hard_a --download=False --output_name=ED_hard_a_processed
+
+# 2) Train (single GPU)
+python train.py --use_vllm=True --run_name=emotion-v1 --model=qwen \
+  --dataset_dir=data/ED_hard_a_processed --vllm_gpu_memory_utilization=0.25
+
+# 3) Evaluate best checkpoint
+python inference.py --checkpoint_path /root/checkpoints/emotion-v1/checkpoint-3564 \
+  --dataset_dir data/ED_hard_a_processed --model qwen --eval_split test
+```
+
+**Note:** This repo includes the `data/` folder so you can reproduce runs without extra downloads.
+
+**Dataset Statistics (ED_hard_a):**
+- Train/Valid/Test sizes depend on the specific ED_hard_a split
+- See `data/ED_hard_a/` for raw CSVs and `data/ED_hard_a_processed/` after preprocessing
 
 ## Emotion Classification
 
-### Supported Emotions (4 classes)
+### Supported Emotions (ED_hard_a, 4 classes)
 
 The system classifies text into 4 emotion categories:
 
-sad, joyful, angry, afraid
+anxious, apprehensive, afraid, terrified
 
 ### Prompt Format
 
-The model uses a reasoning-based prompt format:
-dialogue and identify the emotion expressed. Think through your reasoning step-by-step before providing your answer.
-
-Dialogue: [dialoguelowing review and identify the emotion expressed. Think through your reasoning step-by-step before providing your answer.
-
-Review: [review text]
-
-Provide your analysis in the following format:
-1. First, explain your reasoning about the emotion
-2. Then, provide your final answer in this exact format: <answer>emotion_name</answer>
+The model uses a reasoning-based prompt format and requires the final answer tag to be last.
+The prompt asks for 2–3 concise sentences of reasoning, then:
+`<answer>emotion_name</answer>`
 ```
 
 ### Output Format
@@ -178,7 +186,7 @@ Expected model output:
 ```
 [Chain-of-thought reasoning explaining the emotion analysis]
 
-<answer>joy</answer>
+<answer>afraid</answer>
 ```
 
 ## Performance Metrics
@@ -274,15 +282,14 @@ pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu12
 To train the model:
 
 ```bash
-# Single GPU training with vLLM
+# Single GPU training with vLLM (ED_hard_a)
 python train.py \
     --use_vllm=True \
-    --num_train_epochs=3 \
-    --run_name=emotion-rl-v1 \
-    --model=gemma \
-    --vllm_gpu_memory_utilization=0.25 \
-    --eval_on_start=False \
-    --max_new_tokens=300
+    --num_train_epochs=10 \
+    --run_name=emotion-v1 \
+    --model=qwen \
+    --dataset_dir=data/ED_hard_a_processed \
+    --vllm_gpu_memory_utilization=0.25
 ```
 
 ### Training Parameters
@@ -300,13 +307,13 @@ Key parameters:
 ### Training Hyperparameters (defaults)
 
 ```python
-train_batch_size: 4
-eval_batch_size: 32
+train_batch_size: 2
+eval_batch_size: 20
 warmup_steps: 32
-num_train_epochs: 3
+num_train_epochs: 1
 group_size: 4  # GRPO group size
-learning_rate: 5e-7
-max_new_tokens: 300  # Increased for reasoning
+learning_rate: 5e-6
+max_new_tokens: 64
 ```
 
 ### Checkpoint Management
@@ -321,10 +328,32 @@ Resume training:
 python train.py \
     --use_vllm=True \
     --num_train_epochs=1 \
-    --run_name=emotion-rl-v1 \
-    --model=gemma \
+    --run_name=emotion-v1 \
+    --model=qwen \
+    --dataset_dir=data/ED_hard_a_processed \
     --vllm_gpu_memory_utilization=0.25 \
     --resume_from_checkpoint=True
+```
+
+### Inference / Evaluation
+
+```bash
+python inference.py \
+    --checkpoint_path /root/checkpoints/emotion-v1/checkpoint-3564 \
+    --dataset_dir data/ED_hard_a_processed \
+    --model qwen \
+    --eval_split test
+```
+
+To evaluate the base model without trained weights:
+
+```bash
+python inference.py \
+    --dataset_dir data/ED_hard_a_processed \
+    --model qwen \
+    --use_base_model \
+    --eval_split test
+```
 ```
 
 ## Citation

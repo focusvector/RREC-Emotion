@@ -9,7 +9,6 @@ __pycache__/
 .vscode/
 
 # Datasets and outputs
-data/
 checkpoints/
 
 # OS-specific

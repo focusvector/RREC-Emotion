@@ -1,0 +1,36 @@
+{
+  "citation": "",
+  "description": "",
+  "features": {
+    "text": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "aug_text": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "label": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "seq_labels": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "emotion": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "review_id": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "interaction_id": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": ""
+}
