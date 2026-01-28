@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.vscode/
+
+# Datasets and outputs
+data/
+checkpoints/
+
+# OS-specific
+*Zone.Identifier
