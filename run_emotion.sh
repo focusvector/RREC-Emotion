@@ -4,5 +4,5 @@ cd /root/r2ec
     --run_name emotion-v1 \
     --dataset_dir data/ED_hard_a_processed \
     --vllm_gpu_memory_utilization 0.3\
-    --num_train_epochs 10 \
+    --num_train_epochs 1 \
     --use_vllm
