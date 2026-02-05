@@ -40,6 +40,16 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class GenRecTrainingArguments(TrainingArguments):
+    """
+    Training arguments specific to Generative Recommendation models.
+    
+    Extends the base TrainingArguments with parameters for:
+    - Embedding token configuration
+    - User and item input processing
+    - Generation settings and batch sizes
+    - vLLM integration for efficient inference
+    - Similarity computation configuration
+    """
     label_names: Optional[List[str]] = field(
         default_factory=lambda: ["seq_labels"],
         metadata={"help": "The list of keys in your dictionary of inputs that correspond to the labels."}
@@ -152,6 +162,21 @@ class GenRecTrainingArguments(TrainingArguments):
 
 
 class GenRecTrainer(Trainer):
+    """
+    Custom trainer for Generative Recommendation models with emotion reasoning.
+    
+    This trainer extends the HuggingFace Trainer to support:
+    - User and item profile generation
+    - Efficient embedding computation for recommendation
+    - vLLM integration for fast inference during training
+    - Multi-step generation and reasoning
+    - Contrastive learning with similarity-based training
+    
+    The trainer manages three types of prompters:
+    - UserGenPrompter: Generates user profile reasoning
+    - UserPrompter: Formats user inputs for the model
+    - ItemPrompter: Formats item inputs for the model
+    """
 
     def __init__(
             self,
@@ -167,6 +192,22 @@ class GenRecTrainer(Trainer):
             optimizers=(None, None),
             preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
     ):
+        """
+        Initialize the GenRecTrainer.
+        
+        Args:
+            model: The model to train (typically a causal language model)
+            args: Training arguments with GenRec-specific parameters
+            data_collator: Collator for batching data samples
+            full_dataset: Complete dataset with train/valid/test/item_info splits
+            processing_class: Tokenizer for text processing
+            model_init: Optional function to initialize the model
+            compute_loss_func: Optional custom loss computation function
+            compute_metrics: Optional metrics computation function
+            callbacks: Optional list of training callbacks
+            optimizers: Tuple of (optimizer, lr_scheduler)
+            preprocess_logits_for_metrics: Optional function to preprocess logits
+        """
         self.args = args
         self.args.mini_batch_size = min(self.args.mini_batch_size, self.args.per_device_train_batch_size)
 
@@ -200,12 +241,13 @@ class GenRecTrainer(Trainer):
         self.user_prompter = user_prompter
         print("Prompters initialized, start converting datasets...", end='')
 
+        # Convert datasets using respective prompters to format inputs correctly
         for split in ['train', 'valid', 'test']:
             full_dataset[split] = self.get_user_profile_prompter.convert_dataset(dset=full_dataset[split])
 
         full_dataset['item_info'] = item_prompter.convert_dataset(dset=full_dataset['item_info'])
 
-        # Add idx column to train dataset
+        # Add index column to track samples during training for data augmentation
         full_dataset['train'] = full_dataset['train'].add_column("train_data_id", range(len(full_dataset['train'])))
         train_dataset = full_dataset['train']
 
@@ -237,9 +279,11 @@ class GenRecTrainer(Trainer):
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
 
-        self.item_hs = None
+        # Item embeddings cache and similarity function
+        self.item_hs = None  # Will store precomputed item embeddings
         self.similarity = Similarity(self.args)
 
+        # Initialize vLLM engine if enabled (for fast generation during training)
         if args.use_vllm:
             if self.accelerator.is_main_process:
                 vllm_device = self.args.vllm_device
@@ -323,7 +367,22 @@ class GenRecTrainer(Trainer):
             print('*' * 20 + ' VLLM moved to vllm' + '*' * 20)
 
     def _generate_item_embeddings(self, model, input_prefix: str = "item"):
+        """
+        Generate embeddings for all items in the catalog.
+        
+        Two methods are supported:
+        1. Direct embeddings: Average token embeddings from the embedding layer
+        2. Model forward: Pass items through the model to get contextualized embeddings
+        
+        Args:
+            model: The model to use for generating embeddings
+            input_prefix: Prefix for input keys in the batch (default: "item")
+        
+        Sets:
+            self.item_hs: Tensor of shape [num_items, hidden_size] with item embeddings
+        """
         if getattr(self.args, "direct_item_embeddings", False):
+            # Method 1: Direct token embedding averaging (faster, simpler)
             with torch.no_grad():
                 embed_layer = model.get_input_embeddings()
                 item_ids = sorted(self.item_dataset["item_id"])
@@ -338,10 +397,12 @@ class GenRecTrainer(Trainer):
                         tokens = [self.processing_class.pad_token_id]
                     input_ids = torch.tensor(tokens, device=self.accelerator.device).unsqueeze(0)
                     token_embs = embed_layer(input_ids).squeeze(0)
+                    # Average token embeddings to get item representation
                     item_h = token_embs.mean(dim=0)
                     item_hs.append(item_h)
                 self.item_hs = torch.stack(item_hs)
         else:
+            # Method 2: Model forward pass (more expensive, contextualized)
             with torch.no_grad():
                 dataloader = self._get_item_embed_dataloader()
                 all_item_hs = []
@@ -357,11 +418,14 @@ class GenRecTrainer(Trainer):
                     )
                     all_item_hs.append({"item_h": item_h, "item_id": item_id})
                 
+                # Synchronize all processes before gathering
                 self.accelerator.wait_for_everyone()
                 item_hs = {}
                 torch.cuda.empty_cache()
+                # Gather embeddings from all processes
                 all_item_hs = self.accelerator.gather_for_metrics(all_item_hs)
                 
+                # Build item_id -> embedding dictionary
                 for item_batch_dict in all_item_hs:
                     for batch_idx in range(len(item_batch_dict["item_id"])):
                         item_id = item_batch_dict["item_id"][batch_idx]
@@ -370,6 +434,7 @@ class GenRecTrainer(Trainer):
                 
                 assert len(item_hs) == len(self.item_dataset), f"{len(item_hs)} != {len(self.item_dataset)}"
                 
+                # Sort by item_id to ensure consistent ordering
                 item_ids = self.item_dataset['item_id']
                 item_ids = sorted(item_ids)
                 item_hs = [item_hs[item_id].to(self.accelerator.device) for item_id in item_ids]
@@ -378,6 +443,18 @@ class GenRecTrainer(Trainer):
         assert self.item_hs.shape[0] == len(self.item_dataset)
 
     def get_model_for_eval(self):
+        """
+        Prepare the model for evaluation.
+        
+        This handles:
+        - DeepSpeed initialization for inference
+        - Model wrapping and device placement
+        - Precision conversion (fp16/bf16)
+        - Setting model to eval mode
+        
+        Returns:
+            The prepared model ready for evaluation
+        """
         assert not self.args.jit_mode_eval, "JIT mode is not supported for evaluation."
         if self.is_deepspeed_enabled and self.deepspeed is None:
             _, _ = deepspeed_init(self, num_training_steps=0, inference=True)
@@ -413,6 +490,18 @@ class GenRecTrainer(Trainer):
         return model
 
     def _gather_and_cat(self, tensor):
+        """
+        Gather tensors from all processes and concatenate them.
+        
+        Used for distributed training to collect tensors from all GPUs,
+        excluding the current process to avoid duplication.
+        
+        Args:
+            tensor: Tensor to gather across processes
+            
+        Returns:
+            Concatenated tensor with data from all processes
+        """
         num_processes = self.accelerator.num_processes
         tmp_tensor = tensor.detach()
         gathered_tensor = self.accelerator.gather_for_metrics([tmp_tensor], use_gather_object=True)
@@ -461,6 +550,12 @@ class GenRecTrainer(Trainer):
                 rich.print(f"[yellow]Warning: vLLM weight sync failed: {e}[/yellow]")
 
     def _get_item_embed_dataloader(self):
+        """
+        Create a DataLoader for item embedding generation.
+        
+        Returns:
+            DataLoader configured with appropriate batch size and workers
+        """
         dataloader_params = {
             "batch_size": self.args.item_emb_batch_size,
             "collate_fn": self.data_collator,
@@ -475,6 +570,21 @@ class GenRecTrainer(Trainer):
     def _batch_generate(self, model, batch: Dict[str, torch.LongTensor],
                         input_ids_key="input_ids", attn_mask_key="attention_mask",
                         do_sample=True, num_return_sequences=None, **kwargs) -> List[List[str]]:
+        """
+        Generate text from the model for a batch of inputs.
+        
+        Args:
+            model: The model to generate with
+            batch: Dictionary containing input_ids and attention_mask
+            input_ids_key: Key for input token ids in batch
+            attn_mask_key: Key for attention mask in batch
+            do_sample: Whether to use sampling (True) or greedy decoding (False)
+            num_return_sequences: Number of sequences to generate per input
+            **kwargs: Additional arguments for model.generate()
+            
+        Returns:
+            List of lists, where each inner list contains generated texts for one input
+        """
         ctx = amp.autocast("cuda") if self.args.bf16 else nullcontext()
         with ctx:
             if do_sample:
@@ -510,6 +620,22 @@ class GenRecTrainer(Trainer):
 
     def evaluate(self, eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
                  ignore_keys: Optional[List[str]] = None, metric_key_prefix: str = "eval") -> Dict[str, float]:
+        """
+        Evaluate the model on the evaluation dataset.
+        
+        This method:
+        1. Generates item embeddings
+        2. Generates user reasoning/profiles for each eval sample
+        3. Computes evaluation metrics
+        
+        Args:
+            eval_dataset: Optional dataset to evaluate on (uses self.eval_dataset if None)
+            ignore_keys: Keys to ignore when gathering predictions
+            metric_key_prefix: Prefix for metric names in logs
+            
+        Returns:
+            Dictionary of evaluation metrics
+        """
         if eval_dataset is None:
             eval_model = self.get_model_for_eval()
             self._generate_item_embeddings(eval_model)
@@ -529,6 +655,19 @@ class GenRecTrainer(Trainer):
         return eval_output
 
     def _update_eval_set(self, model, eval_dataset, prefix='user'):
+        """
+        Generate reasoning/profiles for evaluation dataset samples.
+        
+        Uses either vLLM (fast) or standard generation to create user profiles.
+        
+        Args:
+            model: The model to generate with
+            eval_dataset: Dataset to generate profiles for
+            prefix: Prefix for input keys (default: 'user')
+            
+        Returns:
+            Dataset with added 'profile' column containing generated text
+        """
         if 'profile' in eval_dataset.column_names:
             eval_dataset = eval_dataset.remove_columns('profile')
         id_key_name = 'interaction_id'
@@ -578,6 +717,21 @@ class GenRecTrainer(Trainer):
         return eval_dataset
 
     def _generate_in_train(self, model, batch):
+        """
+        Generate user profiles during training for online policy updates.
+        
+        This is a key method for reinforcement learning-based training:
+        1. Generates user reasoning with current policy (vLLM or standard)
+        2. Computes log probabilities for generated sequences
+        3. Augments batch with generated profiles and old log probs
+        
+        Args:
+            model: The current training model
+            batch: Training batch containing user interaction data
+            
+        Returns:
+            Augmented batch with generated profiles and reference log probabilities
+        """
         train_data_ids = batch["train_data_id"]
         full_batch_size = batch['seq_labels'].shape[0]
         num_processes = self.accelerator.num_processes
@@ -585,6 +739,7 @@ class GenRecTrainer(Trainer):
 
         if self.args.use_vllm:
             if self.state.global_step != self._last_loaded_step:
+                # Periodically sync weights from training model to vLLM
                 # Note: vLLM V1 engine cannot sync weights in-process (runs in separate process)
                 # We just call _move_model_to_vllm which will log the skip message
                 # The training model still updates via gradient descent - vLLM just uses slightly stale weights
@@ -630,9 +785,11 @@ class GenRecTrainer(Trainer):
                                               num_return_sequences=generation_samples)
                 user_results.extend(result)
 
+        # Construct augmented training batch with generated profiles
         augmented_input = []
         for i in range(full_batch_size):
             original_element = self.train_dataset[train_data_ids[i]]
+            # Add generated profile to the element
             element = original_element | {"profile": user_results[i]}
             element = self.user_prompter.to_chat_example(element)
             tensor_element = self.user_prompter.totensor_multiple(element)
@@ -647,13 +804,16 @@ class GenRecTrainer(Trainer):
             if isinstance(augmented_input[k], torch.Tensor):
                 augmented_input[k] = augmented_input[k].to(self.accelerator.device)
 
+        # Compute reference log probabilities for PPO/RL objectives
         with torch.no_grad():
             per_token_logps, loss_mask = self._efficient_forward(
                 model, augmented_input, prefix="multi_user", return_with_last_hidden_states=False
             )
+            # Compute sequence-level log probabilities (normalized by length)
             seq_logps = (per_token_logps * loss_mask).sum(dim=1)
             seq_lengths = loss_mask.sum(dim=1)
             seq_logps = seq_logps / (seq_lengths + 1e-8)
+            # Store reference probabilities for KL divergence computation
             augmented_input["old_seq_logps"] = seq_logps.detach()
             augmented_input["old_per_token_logps"] = per_token_logps.detach()
 
@@ -667,6 +827,25 @@ class GenRecTrainer(Trainer):
 
     def _efficient_forward(self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]],
                            prefix: str = "", return_with_last_hidden_states: bool = False):
+        """
+        Efficient forward pass that computes per-token log probabilities.
+        
+        Optimizations:
+        - Removes padding columns that are empty across the batch
+        - Only computes logits for tokens where loss is computed (loss_mask)
+        - Uses selective_log_softmax for memory efficiency
+        
+        Args:
+            model: The model to run forward pass on
+            batch: Batch dictionary with input_ids, attention_mask, labels
+            prefix: Prefix for keys in batch dictionary
+            return_with_last_hidden_states: Whether to return hidden states
+            
+        Returns:
+            per_token_logps: Log probabilities for each token
+            loss_mask: Mask indicating which tokens to compute loss on
+            last_hidden_states: (optional) Hidden states if requested
+        """
         model_kwargs = {"return_dict": True, "return_with_last_hidden_states": return_with_last_hidden_states}
 
         labels = batch[f"{prefix}_labels"]
@@ -674,6 +853,7 @@ class GenRecTrainer(Trainer):
         attention_mask = batch[f"{prefix}_attention_mask"]
         loss_mask = labels != -100
 
+        # Remove padding columns to reduce computation
         empty_cols = torch.sum(attention_mask, dim=0) == 0
         first_empty_col = torch.nonzero(empty_cols)[0].item() if empty_cols.any() else attention_mask.size(1)
         input_ids = input_ids[:, :first_empty_col - 1]
@@ -681,6 +861,7 @@ class GenRecTrainer(Trainer):
         loss_mask = loss_mask[:, :first_empty_col - 1]
         labels = labels[:, :first_empty_col - 1]
 
+        # Only compute logits for positions where we need them (memory optimization)
         first_compute_index = loss_mask.nonzero(as_tuple=True)
         first_compute_index = first_compute_index[1]
         if not len(first_compute_index):
@@ -695,6 +876,7 @@ class GenRecTrainer(Trainer):
         if return_with_last_hidden_states:
             outputs, last_hidden_states = outputs
 
+        # Shift and align logits with input tokens for next-token prediction
         logits = outputs.logits[:, :-1, :]
         logits = logits[:, -num_logits_to_keep:]
         input_ids = input_ids[:, 1:]
@@ -702,6 +884,7 @@ class GenRecTrainer(Trainer):
         loss_mask = loss_mask[:, 1:]
         loss_mask = loss_mask[:, -num_logits_to_keep:]
 
+        # Compute log probabilities efficiently
         per_token_logps = selective_log_softmax(logits, input_ids)
 
         if return_with_last_hidden_states:
@@ -709,10 +892,29 @@ class GenRecTrainer(Trainer):
         return per_token_logps, loss_mask
 
     def store_metrics(self, metrics, metric_key_prefix="train"):
+        """
+        Store metrics to be logged later.
+        
+        Args:
+            metrics: Dictionary of metric name -> value
+            metric_key_prefix: Prefix for organizing metrics (e.g., 'train', 'eval')
+        """
         for key, value in metrics.items():
             self._stored_metrics[metric_key_prefix][key].append(value)
 
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
+        """
+        Log metrics, gathering stored metrics from all processes.
+        
+        Aggregates metrics stored via store_metrics() across all processes
+        and adds them to the logs.
+        
+        Args:
+            logs: Dictionary to add aggregated metrics to
+            *args: Additional arguments passed to parent log method
+            **kwargs: Additional keyword arguments passed to parent log method
+        """
+        # Gather and aggregate metrics from all processes
         metric_key_prefixes = list(self._stored_metrics.keys())
         for metric_key_prefix in metric_key_prefixes:
             all_store_metrics = self.accelerator.gather_for_metrics([self._stored_metrics[metric_key_prefix]], use_gather_object=True)
@@ -720,9 +922,11 @@ class GenRecTrainer(Trainer):
                 metrics = [m[key] for m in all_store_metrics]
                 metrics = torch.tensor(metrics)
                 metrics_mean = metrics.mean().item()
+                # Add prefix to metric names (except for train metrics)
                 if metric_key_prefix == "train":
                     logs[key] = metrics_mean
                 else:
                     logs[f"{metric_key_prefix}_{key}"] = metrics_mean
+            # Clear stored metrics after logging
             del self._stored_metrics[metric_key_prefix]
         return super().log(logs, *args, **kwargs)
